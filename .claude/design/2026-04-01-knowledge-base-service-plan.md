@@ -22,6 +22,7 @@ projects/knowledge-base/
 │   │   └── minio.ts             # MinIO 客户端
 │   ├── models/
 │   │   ├── apiKey.ts            # API Key Mongoose schema
+│   │   ├── systemConfig.ts      # system_config schema（默认知识库映射）
 │   │   └── mediaTask.ts         # media_tasks Mongoose schema（状态机）
 │   ├── middleware/
 │   │   └── auth.ts              # Bearer Token 验证，注入 teamId 到 ctx
@@ -31,6 +32,7 @@ projects/knowledge-base/
 │   │   ├── collections.ts       # CRUD /v1/datasets/:id/collections
 │   │   ├── data.ts              # POST/DELETE /v1/datasets/:id/data
 │   │   ├── search.ts            # POST /v1/search
+│   │   ├── init.ts              # POST/GET /v1/init + POST /v1/init/reset
 │   │   ├── files.ts             # POST /v1/files/upload（普通文档）
 │   │   ├── media.ts             # POST /v1/files/upload-media（音视频）
 │   │   └── tasks.ts             # GET /v1/tasks/:id 和 /stream（SSE）
@@ -926,7 +928,188 @@ git commit -m "feat(knowledge-base): collection CRUD and data push endpoints"
 
 ---
 
-## Task 7: 向量检索 API
+## Task 7: 默认知识库初始化（Init）
+
+**Files:**
+- Create: `projects/knowledge-base/src/models/systemConfig.ts`
+- Create: `projects/knowledge-base/src/routes/init.ts`
+- Modify: `projects/knowledge-base/src/index.ts`
+
+- [ ] **Step 1: 创建 src/models/systemConfig.ts**
+
+```typescript
+import mongoose, { Schema } from 'mongoose';
+
+export type SystemConfigDoc = {
+  _id: mongoose.Types.ObjectId;
+  teamId: string;
+  defaultDatasetId: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+const SystemConfigSchema = new Schema<SystemConfigDoc>(
+  {
+    teamId: { type: String, required: true, unique: true },
+    defaultDatasetId: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+
+export const MongoSystemConfig = mongoose.model<SystemConfigDoc>(
+  'system_configs',
+  SystemConfigSchema
+);
+```
+
+- [ ] **Step 2: 创建 src/routes/init.ts**
+
+```typescript
+import { Hono } from 'hono';
+import { zValidator } from '@hono/zod-validator';
+import { z } from 'zod';
+import { MongoSystemConfig } from '../models/systemConfig';
+import { MongoDataset } from '@fastgpt/service/core/dataset/schema';
+import { MongoDatasetCollection } from '@fastgpt/service/core/dataset/collection/schema';
+import { MongoDatasetData } from '@fastgpt/service/core/dataset/data/schema';
+import { deleteDatasetDataVector } from '@fastgpt/service/common/vectorDB/controller';
+
+export const initRouter = new Hono<{ Variables: { teamId: string } }>();
+
+const InitSchema = z.object({
+  name: z.string().min(1).max(100).default('default'),
+  vectorModel: z.string().default('text-embedding-3-small'),
+  agentModel: z.string().default('gpt-4o-mini'),
+});
+
+// 查询当前默认知识库
+initRouter.get('/', async (c) => {
+  const teamId = c.get('teamId');
+  const config = await MongoSystemConfig.findOne({ teamId }).lean();
+
+  if (!config) {
+    return c.json({ status: 'not_initialized', datasetId: null });
+  }
+
+  const dataset = await MongoDataset.findOne({
+    _id: config.defaultDatasetId,
+    teamId,
+  }).lean();
+
+  if (!dataset) {
+    // 记录存在但 dataset 已被删除，清理
+    await MongoSystemConfig.deleteOne({ teamId });
+    return c.json({ status: 'not_initialized', datasetId: null });
+  }
+
+  return c.json({
+    status: 'ready',
+    datasetId: config.defaultDatasetId,
+    name: dataset.name,
+  });
+});
+
+// 初始化默认知识库（幂等）
+initRouter.post('/', zValidator('json', InitSchema), async (c) => {
+  const teamId = c.get('teamId');
+  const body = c.req.valid('json');
+
+  const existing = await MongoSystemConfig.findOne({ teamId }).lean();
+  if (existing) {
+    // 验证 dataset 仍然存在
+    const dataset = await MongoDataset.findOne({
+      _id: existing.defaultDatasetId,
+      teamId,
+    }).lean();
+
+    if (dataset) {
+      return c.json({
+        datasetId: existing.defaultDatasetId,
+        status: 'already_exists',
+      });
+    }
+
+    // dataset 已被删除，重新创建
+    await MongoSystemConfig.deleteOne({ teamId });
+  }
+
+  const dataset = await MongoDataset.create({
+    teamId,
+    tmbId: teamId,
+    name: body.name,
+    vectorModel: body.vectorModel,
+    agentModel: body.agentModel,
+    type: 'dataset',
+  });
+
+  await MongoSystemConfig.create({
+    teamId,
+    defaultDatasetId: dataset._id.toString(),
+  });
+
+  return c.json(
+    { datasetId: dataset._id.toString(), status: 'created' },
+    201
+  );
+});
+
+// 重置默认知识库（清空数据，保留 Dataset 记录）
+initRouter.post('/reset', async (c) => {
+  const teamId = c.get('teamId');
+  const config = await MongoSystemConfig.findOne({ teamId }).lean();
+
+  if (!config) {
+    return c.json({ error: 'Not initialized yet. Call POST /v1/init first.' }, 400);
+  }
+
+  const datasetId = config.defaultDatasetId;
+
+  // 删除所有向量
+  await deleteDatasetDataVector({ teamId, datasetIds: [datasetId], collectionIds: [] });
+  // 删除所有 Data 和 Collection 记录
+  await MongoDatasetData.deleteMany({ teamId, datasetId });
+  await MongoDatasetCollection.deleteMany({ teamId, datasetId });
+
+  return c.json({ datasetId, status: 'reset' });
+});
+```
+
+- [ ] **Step 3: 注册路由到 index.ts**
+
+```typescript
+import { initRouter } from './routes/init';
+v1.route('/init', initRouter);
+```
+
+- [ ] **Step 4: 验证幂等性**
+
+启动服务后执行：
+```bash
+# 第一次调用 → status: "created"
+curl -X POST http://localhost:3010/v1/init \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-kb"}'
+
+# 第二次调用 → status: "already_exists"，datasetId 相同
+curl -X POST http://localhost:3010/v1/init \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-kb"}'
+```
+
+Expected: 两次返回的 `datasetId` 完全一致。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add projects/knowledge-base/src/models/systemConfig.ts projects/knowledge-base/src/routes/init.ts projects/knowledge-base/src/index.ts
+git commit -m "feat(knowledge-base): init endpoint for per-tenant default dataset"
+```
+
+---
+
+## Task 8: 向量检索 API
 
 **Files:**
 - Create: `projects/knowledge-base/src/routes/search.ts`
@@ -1034,7 +1217,7 @@ git commit -m "feat(knowledge-base): vector search endpoint"
 
 ---
 
-## Task 8: 训练 Worker（后台向量化）
+## Task 9: 训练 Worker（后台向量化）
 
 **Files:**
 - Create: `projects/knowledge-base/src/services/trainingWorker.ts`
@@ -1140,7 +1323,7 @@ git commit -m "feat(knowledge-base): background training worker for vectorizatio
 
 ---
 
-## Task 9: 文件上传（普通文档）
+## Task 10: 文件上传（普通文档）
 
 **Files:**
 - Create: `projects/knowledge-base/src/routes/files.ts`
@@ -1257,7 +1440,7 @@ git commit -m "feat(knowledge-base): document file upload with parsing and train
 
 ---
 
-## Task 10: SSE 服务 + media_tasks 模型
+## Task 11: SSE 服务 + media_tasks 模型
 
 **Files:**
 - Create: `projects/knowledge-base/src/services/sse.ts`
@@ -1408,7 +1591,7 @@ git commit -m "feat(knowledge-base): media task model and SSE service"
 
 ---
 
-## Task 11: ffmpeg 封装 + 豆包 ASR
+## Task 12: ffmpeg 封装 + 豆包 ASR
 
 **Files:**
 - Create: `projects/knowledge-base/src/lib/ffmpeg.ts`
@@ -1543,7 +1726,7 @@ git commit -m "feat(knowledge-base): ffmpeg audio extraction and Doubao ASR inte
 
 ---
 
-## Task 12: 音视频处理状态机
+## Task 13: 音视频处理状态机
 
 **Files:**
 - Create: `projects/knowledge-base/src/services/mediaProcessor.ts`
@@ -1794,7 +1977,7 @@ git commit -m "feat(knowledge-base): media processing state machine with recover
 
 ---
 
-## Task 13: 音视频上传路由 + 任务状态路由
+## Task 14: 音视频上传路由 + 任务状态路由
 
 **Files:**
 - Create: `projects/knowledge-base/src/routes/media.ts`
@@ -1973,7 +2156,7 @@ git commit -m "feat(knowledge-base): media upload route and SSE task status endp
 
 ---
 
-## Task 14: Dockerfile
+## Task 15: Dockerfile
 
 **Files:**
 - Create: `projects/knowledge-base/Dockerfile`
@@ -2017,7 +2200,7 @@ git commit -m "feat(knowledge-base): Dockerfile with ffmpeg"
 
 ---
 
-## Task 15: 完整集成测试
+## Task 16: 完整集成测试
 
 **Files:**
 - Create: `projects/knowledge-base/test/integration.test.ts`
@@ -2102,18 +2285,19 @@ git push myfork main
 ## 自检结果
 
 **Spec 覆盖检查：**
-- ✅ 文件上传解析（Task 9）- txt/md/html/pdf/docx/pptx/xlsx/csv
+- ✅ 文件上传解析（Task 10）- txt/md/html/pdf/docx/pptx/xlsx/csv
 - ✅ Textin/Doc2x 高级 PDF 解析（Task 2 global.systemEnv 初始化）
-- ✅ 向量检索 API（Task 7）
+- ✅ 向量检索 API（Task 8）
 - ✅ 知识库 CRUD（Task 5/6）
-- ✅ 训练结果推送（Task 8 training worker）
+- ✅ 默认知识库初始化（Task 7）- 幂等 POST/GET/reset，按 API Key 多租户隔离
+- ✅ 训练结果推送（Task 9 training worker）
 - ✅ 健康检测（Task 5）
-- ✅ 音视频处理 Pipeline（Task 10/11/12/13）
-- ✅ 中断恢复（Task 12 recoverInterruptedTasks）
-- ✅ SSE 状态推送（Task 10/13）
+- ✅ 音视频处理 Pipeline（Task 11/12/13/14）
+- ✅ 中断恢复（Task 13 recoverInterruptedTasks）
+- ✅ SSE 状态推送（Task 11/14）
 - ✅ 独立 API Key 认证（Task 4）
 - ✅ 独立 MongoDB + MinIO（Task 3）
-- ✅ Dockerfile（Task 14）
+- ✅ Dockerfile（Task 15）
 
 **类型一致性：**
 - `TaskStage` 类型定义于 Task 10（`mediaTask.ts`），在 Task 10（`sse.ts`）、Task 12（`mediaProcessor.ts`）和 Task 13（`tasks.ts`）中统一引用

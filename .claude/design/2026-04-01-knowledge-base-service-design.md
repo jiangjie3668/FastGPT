@@ -119,6 +119,22 @@ POST   /v1/datasets/:id/data
   → { dataId: string }
 DELETE /v1/datasets/:id/data/:dataId
 
+# 默认知识库初始化（多租户，按 API Key 隔离）
+POST /v1/init
+  Header: Authorization: Bearer <api-key>
+  Body: { name?: string, vectorModel?: string, agentModel?: string }
+  → 幂等：已初始化则返回现有 datasetId
+  → { datasetId, status: "created" | "already_exists" }
+
+GET /v1/init
+  Header: Authorization: Bearer <api-key>
+  → { datasetId, name, status: "ready" | "not_initialized" }
+
+POST /v1/init/reset
+  Header: Authorization: Bearer <api-key>
+  → 清空当前 teamId 默认知识库所有 Collection + 向量，保留 Dataset 记录
+  → { datasetId, status: "reset" }
+
 # 任务状态查询（轮询）
 GET /v1/tasks/:taskId
   → { taskId, stage, progress, status, error? }
@@ -167,7 +183,19 @@ type TaskEvent = {
 }
 ```
 
-### 5.2 datasets / collections / data 集合
+### 5.2 system_config 集合（默认知识库映射）
+```typescript
+{
+  _id: ObjectId
+  teamId: string           // 与 api_keys.teamId 对应
+  defaultDatasetId: string // 该 teamId 的默认知识库 ID
+  createdAt: Date
+  updatedAt: Date
+}
+// 唯一索引：teamId
+```
+
+### 5.3 datasets / collections / data 集合
 直接复用 `packages/service/core/dataset/` 下的 Mongoose Schema，不重复定义。
 
 ### 5.3 media_tasks 集合（音视频处理状态机）
